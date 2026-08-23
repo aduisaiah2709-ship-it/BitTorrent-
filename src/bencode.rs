@@ -14,6 +14,13 @@ enum State {
     List,
     Dict,
 }
+struct IntReturnType<T> {
+    width: usize,
+    position: usize,
+    should_break: bool,
+    state: State,
+    value: T,
+}
 pub struct Bencode {
     file_path: String,
 }
@@ -24,6 +31,44 @@ impl Bencode {
             file_path: file_path.to_string(),
         }
     }
+
+    // return the new position and the new width IF it matches, else return the old one,
+    // also the boolean is an indicator of whether to break the loop or continue
+    // and also the state is the state
+    // and also the last value is the actual value
+
+    fn handle_int(
+        &self,
+        byte: u8,
+        index: usize,
+        position: usize,
+        width: usize,
+        temp: &[u8],
+    ) -> IntReturnType<i64> {
+        if byte == b'e' {
+            let mut number = &temp[1..index];
+            let number = std::str::from_utf8(number)
+                .unwrap()
+                .parse::<i64>()
+                .expect("not a number");
+            return IntReturnType {
+                width: 1,
+                position: index + 1,
+                should_break: true,
+                state: State::None,
+                value: number,
+            };
+        } else {
+            return IntReturnType {
+                width,
+                position,
+                should_break: false,
+                state: State::Int,
+                value: 0,
+            };
+        }
+    }
+
     pub fn decode(&self) -> Result<(), std::io::Error> {
         let mut _input = std::fs::read(&self.file_path)?;
         let mut input = b"i42e4:hell".to_vec();
@@ -49,20 +94,16 @@ impl Bencode {
                         }
                     }
                     State::Int => {
-                        if byte == b'e' {
-                            let mut number = &temp[1..index];
-                            let number = std::str::from_utf8(number)
-                                .unwrap()
-                                .parse::<i32>()
-                                .expect("not a number");
-                            println!("{number:?}");
-                            position += index + 1;
-                            state = State::None;
-                            width = 1;
-                            break;
-                        } else {
-                            // println!("-{byte}-{index}-{position}-{end}-{}", temp.len());
+                        let result = self.handle_int(byte, index, position, width, temp);
 
+                        if result.should_break {
+                            println!("{}", result.value);
+                            width = result.width;
+                            position = result.position;
+                            state = result.state;
+                            break;
+                            
+                        } else {
                             continue;
                         }
                     }
