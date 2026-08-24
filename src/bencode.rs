@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, io::Read};
 
+#[derive(Debug)]
 enum BValue {
     Int(i64),
     Bytes(Vec<u8>),
@@ -23,6 +24,7 @@ enum ListState {
     Int,
     Bytes(Option<i32>),
     List(Option<State>),
+    End,
 }
 enum Either<T> {
     Left(T),
@@ -69,8 +71,9 @@ impl Bencode {
             if is_list {
                 start = 2;
             }
+
             let mut number = &temp[start..index];
-            println!("{number:?}");
+
             let number = std::str::from_utf8(number)
                 .unwrap()
                 .parse::<i64>()
@@ -78,7 +81,7 @@ impl Bencode {
 
             return ReturnType {
                 width: 1,
-                position: position + index + 1,
+                position: position + index + if is_list { 0 } else { 1 },
                 should_break: true,
                 state: new_state,
                 value: number,
@@ -100,41 +103,60 @@ impl Bencode {
         index: usize,
         position: usize,
         width: usize,
-
         temp: &[u8],
-    ) -> ReturnType<String> {
-        let mut return_type = ReturnType {
+        is_list: bool,
+        is_static_list: bool,
+    ) -> ReturnType<Vec<u8>> {
+        let mut start = 0;
+        if is_list {
+            start = 1;
+        }
+        let mut return_type: ReturnType<Vec<u8>> = ReturnType {
             width,
             position,
             should_break: false,
-            state: State::Bytes(None),
-            value: String::new(),
+            state: if is_static_list {
+                State::List(Box::new(ListState::Bytes(None)))
+            } else {
+                State::Bytes(None)
+            },
+            value: Vec::new(),
         };
         if state_byte.is_none() {
             if byte != b':' {
                 return_type.should_break = false;
+
                 return return_type;
             } else {
-                let length = &temp[0..index];
+                let length = &temp[start..index];
+
                 let number = std::str::from_utf8(length)
                     .unwrap()
                     .parse::<i32>()
                     .expect("not a number");
-                println!("{number:?}");
+
                 return_type.position += index + 1;
                 return_type.width = 1;
-                return_type.state = State::Bytes(Some(number));
+                return_type.state = if is_static_list {
+                    State::List(Box::new(ListState::Bytes(Some(number))))
+                } else {
+                    State::Bytes(Some(number))
+                };
                 return_type.should_break = true;
             }
         } else {
             let length = state_byte.unwrap();
             if index + 1 == length as usize {
-                let string = std::str::from_utf8(&temp[0..=index]).unwrap();
-                println!("{string}");
-                return_type.value = string.to_string();
+                let slice = &temp[0..=index];
+
+                return_type.value = slice.to_vec();
                 return_type.position += index + 1;
                 return_type.width = 1;
-                return_type.state = State::None;
+                return_type.state = if is_static_list {
+                    State::List(Box::new(ListState::None))
+                } else {
+                    State::None
+                };
                 return_type.should_break = true;
             }
         }
@@ -153,12 +175,14 @@ impl Bencode {
     pub fn decode(&self) -> Result<(), std::io::Error> {
         let mut _input = std::fs::read(&self.file_path)?;
         // i42e4:hellli97ee
-        let mut input = b"4:helli42eli97ei47ei87ei98ei78882920ee".to_vec();
+        let mut input = b"i42e4:hellli97ei81ei54ei12ei98ei76e4:john5:testr8:abcdefghe".to_vec();
         let mut position = 0;
         let mut width = 4;
         let mut state = State::None;
         let mut value: Option<BValue> = None;
         let mut start_of_list = true;
+        let mut b_value: Vec<BValue> = Vec::new();
+        let mut list_value: Vec<BValue> = Vec::new();
         while position != input.len() {
             let end = position + width;
             let mut temp = &input[position..end];
@@ -190,7 +214,7 @@ impl Bencode {
                         );
 
                         if result.should_break {
-                            println!("{}", result.value);
+                            b_value.push(BValue::Int(result.value));
                             width = result.width;
                             position = result.position;
                             state = result.state;
@@ -200,9 +224,13 @@ impl Bencode {
                         }
                     }
                     State::Bytes(v) => {
-                        let result = self.handle_byte(*v, byte, index, position, width, temp);
+                        let result =
+                            self.handle_byte(*v, byte, index, position, width, temp, false, false);
 
                         if result.should_break {
+                            if !result.value.is_empty() {
+                                b_value.push(BValue::Bytes(result.value));
+                            }
                             width = result.width;
                             position = result.position;
                             state = result.state;
@@ -218,11 +246,16 @@ impl Bencode {
                                 continue;
                             }
                             if byte.is_ascii_digit() {
-                                state = State::List(Box::new(ListState::Bytes(None)))
+                                state = State::List(Box::new(ListState::Bytes(None)));
+                                continue;
+                            }
+                            if byte == b'e' {
+                                state = State::List(Box::new(ListState::End))
                             }
                         }
                         ListState::Int => {
                             let addition = if start_of_list { 1 } else { 0 };
+
                             let result = self.handle_int(
                                 byte,
                                 index,
@@ -235,7 +268,7 @@ impl Bencode {
                             );
 
                             if result.should_break {
-                                println!("{}", result.value);
+                                list_value.push(BValue::Int(result.value));
                                 width = result.width;
                                 position = result.position;
 
@@ -245,6 +278,41 @@ impl Bencode {
                             } else {
                                 continue;
                             }
+                        }
+                        ListState::Bytes(v) => {
+                            let addition = if start_of_list { 1 } else { 0 };
+
+                            let result = self.handle_byte(
+                                v,
+                                byte,
+                                index,
+                                position + addition,
+                                width,
+                                temp,
+                                start_of_list,
+                                true,
+                            );
+
+                            if result.should_break {
+                                if (!result.value.is_empty()) {
+                                    list_value.push(BValue::Bytes(result.value));
+                                }
+                                width = result.width;
+                                position = result.position;
+
+                                state = result.state;
+                                start_of_list = false;
+                                break;
+                            } else {
+                                continue;
+                            }
+                        }
+                        ListState::End => {
+                            b_value.push(BValue::List(list_value));
+                            list_value = Vec::new();
+                            position += 1;
+
+                            println!("{b_value:#?}");
                         }
                         _ => {}
                     },
