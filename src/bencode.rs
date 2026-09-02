@@ -1,11 +1,17 @@
-use std::{collections::BTreeMap, io::Read};
+use std::{
+    collections::BTreeMap,
+    io::{Error, ErrorKind, Read},
+    result,
+};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum BValue {
     Int(i64),
     Bytes(Vec<u8>),
     List(Vec<BValue>),
     Dict(BTreeMap<Vec<u8>, BValue>),
+    ListInList(Vec<u8>, Vec<BValue>),
+    DictInDict(usize, BTreeMap<Vec<u8>, BValue>),
 }
 #[derive(Debug)]
 enum State {
@@ -15,9 +21,15 @@ enum State {
     Bytes(Option<i32>),
 
     // it can be an integer or a byte or another list? not sure about another list or a dict
-    List(Box<ListState>),
-    Dict,
+    List(Vec<BValue>),
+
+    Dict(
+        Option<i32>,
+        BTreeMap<Vec<u8>, Option<BValue>>,
+        BTreeMap<Vec<u8>, BValue>,
+    ),
 }
+
 #[derive(Debug)]
 enum ListState {
     None,
@@ -36,7 +48,7 @@ struct ReturnType<T> {
     position: usize,
     should_break: bool,
     state: State,
-    value: T,
+    value: Option<T>,
 }
 
 pub struct Bencode {
@@ -72,7 +84,7 @@ impl Bencode {
                 start = 2;
             }
 
-            let mut number = &temp[start..index];
+            let number = &temp[start..index];
 
             let number = std::str::from_utf8(number)
                 .unwrap()
@@ -84,7 +96,7 @@ impl Bencode {
                 position: position + index + if is_list { 0 } else { 1 },
                 should_break: true,
                 state: new_state,
-                value: number,
+                value: Some(number),
             };
         } else {
             return ReturnType {
@@ -92,7 +104,7 @@ impl Bencode {
                 position,
                 should_break: false,
                 state: old_state,
-                value: 0,
+                value: Some(0),
             };
         }
     }
@@ -116,11 +128,11 @@ impl Bencode {
             position,
             should_break: false,
             state: if is_static_list {
-                State::List(Box::new(ListState::Bytes(None)))
+                State::List(Vec::new())
             } else {
                 State::Bytes(None)
             },
-            value: Vec::new(),
+            value: None,
         };
         if state_byte.is_none() {
             if byte != b':' {
@@ -129,16 +141,31 @@ impl Bencode {
                 return return_type;
             } else {
                 let length = &temp[start..index];
-
+                // println!("length {length:?}");
                 let number = std::str::from_utf8(length)
                     .unwrap()
                     .parse::<i32>()
                     .expect("not a number");
 
+                if number == 0 {
+                    // println!("length is zero");
+                    return_type.value = Some(Vec::new());
+                    // println!("{} hi", &temp[index]);
+                    return_type.position += index + 1;
+                    return_type.width = 1;
+                    return_type.state = if is_static_list {
+                        State::List(Vec::new())
+                    } else {
+                        State::None
+                    };
+                    return_type.should_break = true;
+
+                    return return_type;
+                }
                 return_type.position += index + 1;
                 return_type.width = 1;
                 return_type.state = if is_static_list {
-                    State::List(Box::new(ListState::Bytes(Some(number))))
+                    State::List(Vec::new())
                 } else {
                     State::Bytes(Some(number))
                 };
@@ -146,14 +173,15 @@ impl Bencode {
             }
         } else {
             let length = state_byte.unwrap();
+            // println!("length {}", length as usize);
             if index + 1 == length as usize {
                 let slice = &temp[0..=index];
-
-                return_type.value = slice.to_vec();
+                // println!("{slice:?} is slice");
+                return_type.value = Some(slice.to_vec());
                 return_type.position += index + 1;
                 return_type.width = 1;
                 return_type.state = if is_static_list {
-                    State::List(Box::new(ListState::None))
+                    State::List(Vec::new())
                 } else {
                     State::None
                 };
@@ -172,10 +200,15 @@ impl Bencode {
         temp: &[u8],
     ) {
     }
-    pub fn decode(&self) -> Result<(), std::io::Error> {
+    pub fn parse(
+        &self,
+        input: &[u8],
+        list_in_list: bool,
+        dict_in_dict: bool,
+    ) -> Result<BValue, std::io::Error> {
         let mut _input = std::fs::read(&self.file_path)?;
         // i42e4:hellli97ee
-        let mut input = b"i42e4:hellli97ei81ei54ei12ei98ei76e4:john5:testr8:abcdefghe".to_vec();
+
         let mut position = 0;
         let mut width = 4;
         let mut state = State::None;
@@ -183,10 +216,12 @@ impl Bencode {
         let mut start_of_list = true;
         let mut b_value: Vec<BValue> = Vec::new();
         let mut list_value: Vec<BValue> = Vec::new();
+        let mut track_index = 0;
+
         while position != input.len() {
             let end = position + width;
-            let mut temp = &input[position..end];
-
+            let mut temp = &input[position..input.len()];
+            //println!("temp is {temp:?}");
             for index in 0..temp.len() {
                 let byte = temp[index];
                 match &state {
@@ -197,8 +232,9 @@ impl Bencode {
                         } else if byte.is_ascii_digit() {
                             state = State::Bytes(None);
                         } else if byte == b'l' {
-                            state = State::List(Box::new(ListState::None));
-                        } else {
+                            state = State::List(Vec::new());
+                        } else if byte == b'd' {
+                            state = State::Dict(None, BTreeMap::new(), BTreeMap::new());
                         }
                     }
                     State::Int => {
@@ -214,7 +250,7 @@ impl Bencode {
                         );
 
                         if result.should_break {
-                            b_value.push(BValue::Int(result.value));
+                            return Ok(BValue::Int(result.value.unwrap()));
                             width = result.width;
                             position = result.position;
                             state = result.state;
@@ -228,8 +264,8 @@ impl Bencode {
                             self.handle_byte(*v, byte, index, position, width, temp, false, false);
 
                         if result.should_break {
-                            if !result.value.is_empty() {
-                                b_value.push(BValue::Bytes(result.value));
+                            if !result.value.is_none() {
+                                return Ok(BValue::Bytes(result.value.unwrap()));
                             }
                             width = result.width;
                             position = result.position;
@@ -239,83 +275,230 @@ impl Bencode {
                             continue;
                         }
                     }
-                    State::List(v) => match **v {
-                        ListState::None => {
-                            if byte == b'i' {
-                                state = State::List(Box::new(ListState::Int));
-                                continue;
-                            }
-                            if byte.is_ascii_digit() {
-                                state = State::List(Box::new(ListState::Bytes(None)));
-                                continue;
-                            }
-                            if byte == b'e' {
-                                state = State::List(Box::new(ListState::End))
-                            }
-                        }
-                        ListState::Int => {
-                            let addition = if start_of_list { 1 } else { 0 };
-
-                            let result = self.handle_int(
-                                byte,
-                                index,
-                                position + addition,
-                                width,
-                                temp,
-                                State::List(Box::new(ListState::None)),
-                                State::List(Box::new(ListState::Int)),
-                                start_of_list,
-                            );
-
-                            if result.should_break {
-                                list_value.push(BValue::Int(result.value));
-                                width = result.width;
-                                position = result.position;
-
-                                state = result.state;
-                                start_of_list = false;
-                                break;
-                            } else {
-                                continue;
-                            }
-                        }
-                        ListState::Bytes(v) => {
-                            let addition = if start_of_list { 1 } else { 0 };
-
-                            let result = self.handle_byte(
-                                v,
-                                byte,
-                                index,
-                                position + addition,
-                                width,
-                                temp,
-                                start_of_list,
-                                true,
-                            );
-
-                            if result.should_break {
-                                if (!result.value.is_empty()) {
-                                    list_value.push(BValue::Bytes(result.value));
+                    State::List(v) => {
+                        if byte == b'i' {
+                            let vector = temp.to_vec();
+                            let mut location = 0;
+                            for index in vector {
+                                if index == b'e' {
+                                    println!("here");
+                                    break;
+                                } else {
+                                    location += 1;
                                 }
-                                width = result.width;
-                                position = result.position;
+                            }
 
-                                state = result.state;
-                                start_of_list = false;
+                            let number = self
+                                .to_string(&temp[index + 1..location])
+                                .parse::<i64>()
+                                .unwrap();
+                            state = State::List(if v.len() > 0 {
+                                v.iter()
+                                    .chain(vec![&BValue::Int(number)])
+                                    .cloned()
+                                    .collect()
+                            } else {
+                                vec![BValue::Int(number)]
+                            });
+                            position += location + 1;
+                            break;
+                        } else if byte.is_ascii_digit() {
+                            let length: usize = std::str::from_utf8(&[byte])
+                                .unwrap()
+                                .parse::<usize>()
+                                .unwrap();
+
+                            let slice = &temp[index..length + 3];
+
+                            let value = self.parse(slice, false, false).unwrap();
+
+                            position += length + 2;
+                           // println!("position in byte is {position}");
+                            state = State::List(if v.len() > 0 {
+                                v.iter().chain(vec![value].iter()).cloned().collect()
+                            } else {
+                                vec![value]
+                            });
+                            break;
+                        } else if byte == b'l' {
+                            //li64elig4e
+
+                            let slice = &temp[index..];
+                         //   println!("{:?} {:?}", index, slice);
+                            let value = self.parse(slice, true, false)?;
+
+                            if let BValue::ListInList(end, result) = value {
+                              //  println!("position not is {position}");
+
+                                position += temp.len() - end.len();
+
+                                // println!("{result:?} result is");
+                                // println!("{}---{}--{:?}", input.len(), end.len(), temp);
+                                // println!("{:?} usize {end:?} {position}", &input[position..]);
+                                state = State::List(if v.len() > 0 {
+                                    v.iter()
+                                        .chain(vec![BValue::List(result)].iter())
+                                        .cloned()
+                                        .collect()
+                                } else {
+                                    vec![BValue::List(result)]
+                                });
+                                // println!("position in list in list is {position}");
                                 break;
                             } else {
-                                continue;
+                                // println!("hello world");
+                            }
+
+                            // println!("position outside is {position}");
+                        } else if byte == b'd' {
+                            let slice = &temp[index..];
+                            let value = self.parse(slice, false, true)?;
+
+                            if let BValue::DictInDict(end, result) = value {
+                                 
+                                position += 1 + temp.len() - end;
+
+                                state = State::List(if v.len() > 0 {
+                                    v.iter()
+                                        .chain(vec![BValue::Dict(result)].iter())
+                                        .cloned()
+                                        .collect()
+                                } else {
+                                    vec![BValue::Dict(result)]
+                                });
+                                break;
+                            };
+                        } else if byte == b'e' {
+                            position += 1;
+                            // println!(
+                            //     "position in wait {position} {:?} {} {}",
+                            //     &input[position..].to_vec(),
+                            //     input.len(),
+                            //     position < input.len()
+                            // );
+
+                            if let State::List(value) = state {
+                                if list_in_list {
+                                    return Ok(BValue::ListInList(
+                                        input[position..].to_vec(),
+                                        value.to_owned(),
+                                    ));
+                                } else {
+                                    return Ok(BValue::List(value));
+                                }
                             }
                         }
-                        ListState::End => {
-                            b_value.push(BValue::List(list_value));
-                            list_value = Vec::new();
-                            position += 1;
-
-                            println!("{b_value:#?}");
+                    }
+                    State::Dict(parsing, first, map) => {
+                        if byte == b'e' {
+                            if dict_in_dict {
+                                return Ok(BValue::DictInDict(
+                                    input[position..].len(),
+                                    map.clone(),
+                                ));
+                            }
+                            return Ok(BValue::Dict(map.clone()));
                         }
-                        _ => {}
-                    },
+                        if !first.is_empty() && byte == b'd' {
+                            let slice = &temp[index..];
+                            let value = self.parse(slice, false, true)?;
+                            if let BValue::DictInDict(end, result) = value {
+                                position += 1 + temp.len() - end;
+                                // println!("{position}, {:?}", &input[position..]);
+                                let mut map1: BTreeMap<Vec<u8>, BValue> = BTreeMap::new();
+                                for items in first {
+                                    map1.insert(items.0.clone(), BValue::Dict(result.clone()));
+                                }
+                                for items in map {
+                                    map1.insert(items.0.clone(), items.1.clone());
+                                }
+                                state = State::Dict(None, BTreeMap::new(), map1);
+                                break;
+                            }
+                        }
+                        if !first.is_empty() && byte == b'l' {
+                            let slice = &temp[index..];
+                            let value = self.parse(slice, true, false)?;
+
+                            if let BValue::ListInList(end, result) = value {
+                              
+                                position += 1 + temp.len() - end.len();
+                                println!("{}", position);
+                                let mut map1: BTreeMap<Vec<u8>, BValue> = BTreeMap::new();
+                                for items in first {
+                                    map1.insert(items.0.clone(), BValue::List(result.clone()));
+                                }
+                                for items in map {
+                                    map1.insert(items.0.clone(), items.1.clone());
+                                }
+                                state = State::Dict(None, BTreeMap::new(), map1);
+                                break;
+                            };
+                        }
+                        if !first.is_empty() && byte == b'i' {
+                            let vector = temp.to_vec();
+                            let mut location = 0;
+                            for index in vector {
+                                if index == b'e' {
+                                    break;
+                                } else {
+                                    location += 1;
+                                }
+                            }
+                            if location == 0 {
+                                return Err(Error::from(ErrorKind::NotFound));
+                            }
+                            let number = self
+                                .to_string(&temp[index + 1..location])
+                                .parse::<i64>()
+                                .unwrap();
+                            position += location + 1;
+                            let mut map1: BTreeMap<Vec<u8>, BValue> = BTreeMap::new();
+                            for items in first {
+                                map1.insert(items.0.clone(), BValue::Int(number));
+                            }
+                            for items in map {
+                                map1.insert(items.0.clone(), items.1.clone());
+                            }
+
+                            state = State::Dict(None, BTreeMap::new(), map1);
+                            break;
+                        }
+
+                        let length: usize = std::str::from_utf8(&[byte])
+                            .unwrap()
+                            .parse::<usize>()
+                            .unwrap();
+
+                        let slice = &temp[index..length + 3];
+                        let value = self.parse(slice, false, false).unwrap();
+                        // println!("first pos{}--", self.to_string(&input[position..]));
+                        position += length + 3;
+                        //       println!("last {}--", self.to_string(&input[position..]));
+                        if first.is_empty() {
+                            if let BValue::Bytes(key) = &value {
+                                let mut map1: BTreeMap<Vec<u8>, Option<BValue>> = BTreeMap::new();
+
+                                map1.insert(key.clone(), None);
+                                position -= if map.is_empty() { 0 } else { 1 };
+                                state = State::Dict(None, map1, map.clone());
+                                break;
+                            }
+                        } else {
+                            let mut map1: BTreeMap<Vec<u8>, BValue> = BTreeMap::new();
+                            for items in first {
+                                map1.insert(items.0.clone(), value.clone());
+                            }
+                            for items in map {
+                                map1.insert(items.0.clone(), items.1.clone());
+                            }
+                            position -= 1;
+
+                            state = State::Dict(None, BTreeMap::new(), map1);
+                            break;
+                        }
+                        //println!("{value:?}");
+                    }
                     _ => {}
                 }
             }
@@ -324,6 +507,15 @@ impl Bencode {
                 width += 1;
             }
         }
-        Ok(())
+        println!("{:?}", state);
+        Err(Error::new(std::io::ErrorKind::Other, "Unable to parse"))
+    }
+    pub fn decode(&self) {
+        let mut input =b"d5:usersld2:idi1e4:name4:johned2:idi2e4:name3:joeeee";
+        let value = self.parse(input, false, false);
+        println!("one value is {value:?}");
+    }
+    pub fn to_string(&self, slice: &[u8]) -> String {
+        std::str::from_utf8(slice).unwrap().to_string()
     }
 }
