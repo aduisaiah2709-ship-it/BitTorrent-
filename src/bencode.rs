@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fs};
 
 #[derive(Debug, Clone)]
 pub struct Error {
@@ -129,10 +129,14 @@ impl Bencode {
         } else if input.starts_with(b"d") {
             let result = self.handle_dict(&input);
             return result;
+        } else {
+            Err(Error { message: "Unable to parse".into() })
         }
-        Err(Error {
-            message: "Not implemented yet".into(),
-        })
+    }
+    pub fn decode(&self) {
+        let input = fs::read(&self.file_path).expect("file not found");
+        let result = self.parse(&input).unwrap();
+        println!("{:?}", result.0);
     }
     pub fn to_string(&self, slice: &[u8]) -> String {
         std::str::from_utf8(slice).unwrap().to_string()

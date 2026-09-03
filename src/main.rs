@@ -42,7 +42,8 @@ fn main() -> Result<(), std::io::Error> {
          b"d5:usersld2:idi1e4:name4:johned2:idi2e4:name3:joeeee",
          b"d5:usersld2:idi1e4:name4:johned2:idi2e4:name3:joeee5:emptyle6:nestedlli1ei2eeli3ei4eee4:zeroi0e8:negativei-7e5:blank0:e"
     ];
-    run(array);
-    let x = b"4:spam";
+  //  run(array);
+    let bencode = Bencode::new("ubuntu.iso.torrent");
+    bencode.decode();
     Ok(())
 }
