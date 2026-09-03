@@ -1,56 +1,16 @@
-use std::{
-    collections::BTreeMap,
-    io::{Error, ErrorKind, Read},
-    result,
-};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone)]
-enum BValue {
+pub struct Error {
+    message: String,
+}
+#[derive(Debug, Clone)]
+pub enum BValue {
     Int(i64),
     Bytes(Vec<u8>),
     List(Vec<BValue>),
-    Dict(BTreeMap<Vec<u8>, BValue>),
-    ListInList(Vec<u8>, Vec<BValue>),
-    DictInDict(usize, BTreeMap<Vec<u8>, BValue>),
+    Dict(BTreeMap<Vec<u8>, BValue>)
 }
-#[derive(Debug)]
-enum State {
-    None,
-    Int,
-    // if its false or none its still parsing the length, if not, its parsing the value.
-    Bytes(Option<i32>),
-
-    // it can be an integer or a byte or another list? not sure about another list or a dict
-    List(Vec<BValue>),
-
-    Dict(
-        Option<i32>,
-        BTreeMap<Vec<u8>, Option<BValue>>,
-        BTreeMap<Vec<u8>, BValue>,
-    ),
-}
-
-#[derive(Debug)]
-enum ListState {
-    None,
-    Int,
-    Bytes(Option<i32>),
-    List(Option<State>),
-    End,
-}
-enum Either<T> {
-    Left(T),
-    Right(T),
-}
-#[derive(Debug)]
-struct ReturnType<T> {
-    width: usize,
-    position: usize,
-    should_break: bool,
-    state: State,
-    value: Option<T>,
-}
-
 pub struct Bencode {
     file_path: String,
 }
@@ -61,461 +21,124 @@ impl Bencode {
             file_path: file_path.to_string(),
         }
     }
+    pub fn handle_int(&self, slice: &[u8]) -> Result<(BValue, Vec<u8>), Error> {
+        // lets remove the first i
+        let slice = &slice[1..];
+        let mut end: Option<usize> = None;
+        // now we need to recursively or we can use a loop right ? to get the last number
 
-    // return the new position and the new width IF it matches, else return the old one,
-    // also the boolean is an indicator of whether to break the loop or continue
-    // and also the state is the state
-    // and also the last value is the actual value
+        for index in 0..slice.len() {
+            let byte = slice[index];
 
-    fn handle_int(
-        &self,
-        byte: u8,
-        index: usize,
-        position: usize,
-        width: usize,
-        temp: &[u8],
-        new_state: State,
-        old_state: State,
-        is_list: bool,
-    ) -> ReturnType<i64> {
-        if byte == b'e' {
-            let mut start = 1;
-            if is_list {
-                start = 2;
+            if byte == b"e"[0] {
+                end = Some(index);
+                break;
             }
-
-            let number = &temp[start..index];
-
-            let number = std::str::from_utf8(number)
-                .unwrap()
-                .parse::<i64>()
-                .expect("not a number");
-
-            return ReturnType {
-                width: 1,
-                position: position + index + if is_list { 0 } else { 1 },
-                should_break: true,
-                state: new_state,
-                value: Some(number),
-            };
-        } else {
-            return ReturnType {
-                width,
-                position,
-                should_break: false,
-                state: old_state,
-                value: Some(0),
-            };
         }
-    }
-    fn handle_byte(
-        &self,
-        state_byte: Option<i32>,
-        byte: u8,
-        index: usize,
-        position: usize,
-        width: usize,
-        temp: &[u8],
-        is_list: bool,
-        is_static_list: bool,
-    ) -> ReturnType<Vec<u8>> {
-        let mut start = 0;
-        if is_list {
-            start = 1;
-        }
-        let mut return_type: ReturnType<Vec<u8>> = ReturnType {
-            width,
-            position,
-            should_break: false,
-            state: if is_static_list {
-                State::List(Vec::new())
-            } else {
-                State::Bytes(None)
-            },
-            value: None,
+        if end.is_none() {
+            return Err(Error {
+                message: "Unable to find the end marker".into(),
+            });
         };
-        if state_byte.is_none() {
-            if byte != b':' {
-                return_type.should_break = false;
+        let end = end.unwrap();
+        // create a slice of the number
+        let int_slice = &slice[..end];
+        let number = self.to_number(int_slice);
 
-                return return_type;
+        Ok((BValue::Int(number), slice[end + 1..].to_vec()))
+    }
+    pub fn handle_byte(&self, slice: &[u8]) -> Result<(BValue, Vec<u8>), Error> {
+        let mut slice = slice.to_vec(); // why am i converting it to vec? i guess we will never know
+        let mut colon_position: Option<usize> = None;
+        // read until we find :
+        for index in 0..slice.len() {
+            let byte = slice[index];
+            if byte == b":"[0] {
+                colon_position = Some(index);
+                break;
+            }
+        }
+        if colon_position.is_none() {
+            return Err(Error {
+                message: "Unable to find the colon marker".into(),
+            });
+        }
+        let colon_position = colon_position.unwrap();
+        // extract the number in between
+        let number_slice = &slice[0..colon_position];
+        let length: usize = self.to_number(number_slice) as usize;
+
+        slice.drain(0..=colon_position);
+        let bytes = &slice[0..length];
+
+        Ok((BValue::Bytes(bytes.to_vec()), slice[length..].to_vec()))
+    }
+    pub fn handle_list(&self, slice: &[u8]) -> Result<(BValue, Vec<u8>), Error> {
+        let mut slice = slice.to_vec();
+        slice = slice.drain(1..).collect();
+
+        let mut list: Vec<BValue> = Vec::new();
+
+        while !slice.starts_with(b"e") {
+            let result = self.parse(&slice)?;
+            list.push(result.0);
+            slice = result.1;
+        }
+
+        slice = slice[1..].to_vec();
+        Ok((BValue::List(list), slice))
+    }
+    pub fn handle_dict(&self, slice: &[u8]) -> Result<(BValue, Vec<u8>), Error> {
+        let mut slice = slice.to_vec();
+        slice = slice.drain(1..).collect();
+        let mut master_map = BTreeMap::new();
+        let mut key: Option<Vec<u8>> = None;
+
+        while !slice.starts_with(b"e") {
+            if key.is_none() {
+           
+                let result = self.parse(&slice)?;
+                if let BValue::Bytes(bytes) = result.0 {
+                    key = Some(bytes);
+                }
+    
+                slice = result.1;
             } else {
-                let length = &temp[start..index];
-                // println!("length {length:?}");
-                let number = std::str::from_utf8(length)
-                    .unwrap()
-                    .parse::<i32>()
-                    .expect("not a number");
-
-                if number == 0 {
-                    // println!("length is zero");
-                    return_type.value = Some(Vec::new());
-                    // println!("{} hi", &temp[index]);
-                    return_type.position += index + 1;
-                    return_type.width = 1;
-                    return_type.state = if is_static_list {
-                        State::List(Vec::new())
-                    } else {
-                        State::None
-                    };
-                    return_type.should_break = true;
-
-                    return return_type;
-                }
-                return_type.position += index + 1;
-                return_type.width = 1;
-                return_type.state = if is_static_list {
-                    State::List(Vec::new())
-                } else {
-                    State::Bytes(Some(number))
-                };
-                return_type.should_break = true;
-            }
-        } else {
-            let length = state_byte.unwrap();
-            // println!("length {}", length as usize);
-            if index + 1 == length as usize {
-                let slice = &temp[0..=index];
-                // println!("{slice:?} is slice");
-                return_type.value = Some(slice.to_vec());
-                return_type.position += index + 1;
-                return_type.width = 1;
-                return_type.state = if is_static_list {
-                    State::List(Vec::new())
-                } else {
-                    State::None
-                };
-                return_type.should_break = true;
+                let result = self.parse(&slice)?;
+                master_map.insert(key.unwrap(), result.0);
+                key = None;
+                slice = result.1;
             }
         }
-
-        return_type
+        // remove the trailing e
+        slice = slice[1..].to_vec();
+        Ok((BValue::Dict(master_map), slice))
     }
-    fn handle_list(
-        state_list: Option<Vec<State>>,
-        byte: u8,
-        index: usize,
-        position: usize,
-        width: usize,
-        temp: &[u8],
-    ) {
-    }
-    pub fn parse(
-        &self,
-        input: &[u8],
-        list_in_list: bool,
-        dict_in_dict: bool,
-    ) -> Result<BValue, std::io::Error> {
-        let mut _input = std::fs::read(&self.file_path)?;
-        // i42e4:hellli97ee
+    pub fn parse(&self, input: &[u8]) -> Result<(BValue, Vec<u8>), Error> {
+        let input = input.to_vec();
 
-        let mut position = 0;
-        let mut width = 4;
-        let mut state = State::None;
-        let mut value: Option<BValue> = None;
-        let mut start_of_list = true;
-        let mut b_value: Vec<BValue> = Vec::new();
-        let mut list_value: Vec<BValue> = Vec::new();
-        let mut track_index = 0;
-
-        while position != input.len() {
-            let end = position + width;
-            let mut temp = &input[position..input.len()];
-            //println!("temp is {temp:?}");
-            for index in 0..temp.len() {
-                let byte = temp[index];
-                match &state {
-                    State::None => {
-                        if byte == b'i' {
-                            state = State::Int;
-                            continue;
-                        } else if byte.is_ascii_digit() {
-                            state = State::Bytes(None);
-                        } else if byte == b'l' {
-                            state = State::List(Vec::new());
-                        } else if byte == b'd' {
-                            state = State::Dict(None, BTreeMap::new(), BTreeMap::new());
-                        }
-                    }
-                    State::Int => {
-                        let result = self.handle_int(
-                            byte,
-                            index,
-                            position,
-                            width,
-                            temp,
-                            State::None,
-                            State::Int,
-                            false,
-                        );
-
-                        if result.should_break {
-                            return Ok(BValue::Int(result.value.unwrap()));
-                            width = result.width;
-                            position = result.position;
-                            state = result.state;
-                            break;
-                        } else {
-                            continue;
-                        }
-                    }
-                    State::Bytes(v) => {
-                        let result =
-                            self.handle_byte(*v, byte, index, position, width, temp, false, false);
-
-                        if result.should_break {
-                            if !result.value.is_none() {
-                                return Ok(BValue::Bytes(result.value.unwrap()));
-                            }
-                            width = result.width;
-                            position = result.position;
-                            state = result.state;
-                            break;
-                        } else {
-                            continue;
-                        }
-                    }
-                    State::List(v) => {
-                        if byte == b'i' {
-                            let vector = temp.to_vec();
-                            let mut location = 0;
-                            for index in vector {
-                                if index == b'e' {
-                                    println!("here");
-                                    break;
-                                } else {
-                                    location += 1;
-                                }
-                            }
-
-                            let number = self
-                                .to_string(&temp[index + 1..location])
-                                .parse::<i64>()
-                                .unwrap();
-                            state = State::List(if v.len() > 0 {
-                                v.iter()
-                                    .chain(vec![&BValue::Int(number)])
-                                    .cloned()
-                                    .collect()
-                            } else {
-                                vec![BValue::Int(number)]
-                            });
-                            position += location + 1;
-                            break;
-                        } else if byte.is_ascii_digit() {
-                            let length: usize = std::str::from_utf8(&[byte])
-                                .unwrap()
-                                .parse::<usize>()
-                                .unwrap();
-
-                            let slice = &temp[index..length + 3];
-
-                            let value = self.parse(slice, false, false).unwrap();
-
-                            position += length + 2;
-                           // println!("position in byte is {position}");
-                            state = State::List(if v.len() > 0 {
-                                v.iter().chain(vec![value].iter()).cloned().collect()
-                            } else {
-                                vec![value]
-                            });
-                            break;
-                        } else if byte == b'l' {
-                            //li64elig4e
-
-                            let slice = &temp[index..];
-                         //   println!("{:?} {:?}", index, slice);
-                            let value = self.parse(slice, true, false)?;
-
-                            if let BValue::ListInList(end, result) = value {
-                              //  println!("position not is {position}");
-
-                                position += temp.len() - end.len();
-
-                                // println!("{result:?} result is");
-                                // println!("{}---{}--{:?}", input.len(), end.len(), temp);
-                                // println!("{:?} usize {end:?} {position}", &input[position..]);
-                                state = State::List(if v.len() > 0 {
-                                    v.iter()
-                                        .chain(vec![BValue::List(result)].iter())
-                                        .cloned()
-                                        .collect()
-                                } else {
-                                    vec![BValue::List(result)]
-                                });
-                                // println!("position in list in list is {position}");
-                                break;
-                            } else {
-                                // println!("hello world");
-                            }
-
-                            // println!("position outside is {position}");
-                        } else if byte == b'd' {
-                            let slice = &temp[index..];
-                            let value = self.parse(slice, false, true)?;
-
-                            if let BValue::DictInDict(end, result) = value {
-                                 
-                                position += 1 + temp.len() - end;
-
-                                state = State::List(if v.len() > 0 {
-                                    v.iter()
-                                        .chain(vec![BValue::Dict(result)].iter())
-                                        .cloned()
-                                        .collect()
-                                } else {
-                                    vec![BValue::Dict(result)]
-                                });
-                                break;
-                            };
-                        } else if byte == b'e' {
-                            position += 1;
-                            // println!(
-                            //     "position in wait {position} {:?} {} {}",
-                            //     &input[position..].to_vec(),
-                            //     input.len(),
-                            //     position < input.len()
-                            // );
-
-                            if let State::List(value) = state {
-                                if list_in_list {
-                                    return Ok(BValue::ListInList(
-                                        input[position..].to_vec(),
-                                        value.to_owned(),
-                                    ));
-                                } else {
-                                    return Ok(BValue::List(value));
-                                }
-                            }
-                        }
-                    }
-                    State::Dict(parsing, first, map) => {
-                        if byte == b'e' {
-                            if dict_in_dict {
-                                return Ok(BValue::DictInDict(
-                                    input[position..].len(),
-                                    map.clone(),
-                                ));
-                            }
-                            return Ok(BValue::Dict(map.clone()));
-                        }
-                        if !first.is_empty() && byte == b'd' {
-                            let slice = &temp[index..];
-                            let value = self.parse(slice, false, true)?;
-                            if let BValue::DictInDict(end, result) = value {
-                                position += 1 + temp.len() - end;
-                                // println!("{position}, {:?}", &input[position..]);
-                                let mut map1: BTreeMap<Vec<u8>, BValue> = BTreeMap::new();
-                                for items in first {
-                                    map1.insert(items.0.clone(), BValue::Dict(result.clone()));
-                                }
-                                for items in map {
-                                    map1.insert(items.0.clone(), items.1.clone());
-                                }
-                                state = State::Dict(None, BTreeMap::new(), map1);
-                                break;
-                            }
-                        }
-                        if !first.is_empty() && byte == b'l' {
-                            let slice = &temp[index..];
-                            let value = self.parse(slice, true, false)?;
-
-                            if let BValue::ListInList(end, result) = value {
-                              
-                                position += 1 + temp.len() - end.len();
-                                println!("{}", position);
-                                let mut map1: BTreeMap<Vec<u8>, BValue> = BTreeMap::new();
-                                for items in first {
-                                    map1.insert(items.0.clone(), BValue::List(result.clone()));
-                                }
-                                for items in map {
-                                    map1.insert(items.0.clone(), items.1.clone());
-                                }
-                                state = State::Dict(None, BTreeMap::new(), map1);
-                                break;
-                            };
-                        }
-                        if !first.is_empty() && byte == b'i' {
-                            let vector = temp.to_vec();
-                            let mut location = 0;
-                            for index in vector {
-                                if index == b'e' {
-                                    break;
-                                } else {
-                                    location += 1;
-                                }
-                            }
-                            if location == 0 {
-                                return Err(Error::from(ErrorKind::NotFound));
-                            }
-                            let number = self
-                                .to_string(&temp[index + 1..location])
-                                .parse::<i64>()
-                                .unwrap();
-                            position += location + 1;
-                            let mut map1: BTreeMap<Vec<u8>, BValue> = BTreeMap::new();
-                            for items in first {
-                                map1.insert(items.0.clone(), BValue::Int(number));
-                            }
-                            for items in map {
-                                map1.insert(items.0.clone(), items.1.clone());
-                            }
-
-                            state = State::Dict(None, BTreeMap::new(), map1);
-                            break;
-                        }
-
-                        let length: usize = std::str::from_utf8(&[byte])
-                            .unwrap()
-                            .parse::<usize>()
-                            .unwrap();
-
-                        let slice = &temp[index..length + 3];
-                        let value = self.parse(slice, false, false).unwrap();
-                        // println!("first pos{}--", self.to_string(&input[position..]));
-                        position += length + 3;
-                        //       println!("last {}--", self.to_string(&input[position..]));
-                        if first.is_empty() {
-                            if let BValue::Bytes(key) = &value {
-                                let mut map1: BTreeMap<Vec<u8>, Option<BValue>> = BTreeMap::new();
-
-                                map1.insert(key.clone(), None);
-                                position -= if map.is_empty() { 0 } else { 1 };
-                                state = State::Dict(None, map1, map.clone());
-                                break;
-                            }
-                        } else {
-                            let mut map1: BTreeMap<Vec<u8>, BValue> = BTreeMap::new();
-                            for items in first {
-                                map1.insert(items.0.clone(), value.clone());
-                            }
-                            for items in map {
-                                map1.insert(items.0.clone(), items.1.clone());
-                            }
-                            position -= 1;
-
-                            state = State::Dict(None, BTreeMap::new(), map1);
-                            break;
-                        }
-                        //println!("{value:?}");
-                    }
-                    _ => {}
-                }
-            }
-
-            if position + width != input.len() {
-                width += 1;
-            }
+        if input.starts_with(b"i") {
+            let result = self.handle_int(&input);
+            return result;
+        } else if input[0].is_ascii_digit() {
+            let result = self.handle_byte(&input);
+            return result;
+        } else if input.starts_with(b"l") {
+            let result = self.handle_list(&input);
+            return result;
+        } else if input.starts_with(b"d") {
+            let result = self.handle_dict(&input);
+            return result;
         }
-        println!("{:?}", state);
-        Err(Error::new(std::io::ErrorKind::Other, "Unable to parse"))
-    }
-    pub fn decode(&self) {
-        let mut input =b"d5:usersld2:idi1e4:name4:johned2:idi2e4:name3:joeeee";
-        let value = self.parse(input, false, false);
-        println!("one value is {value:?}");
+        Err(Error {
+            message: "Not implemented yet".into(),
+        })
     }
     pub fn to_string(&self, slice: &[u8]) -> String {
         std::str::from_utf8(slice).unwrap().to_string()
+    }
+    pub fn to_number(&self, slice: &[u8]) -> i64 {
+        let number_to_str = self.to_string(slice);
+        number_to_str.parse::<i64>().unwrap()
     }
 }
